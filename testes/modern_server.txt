@@ -1,0 +1,277 @@
+---@class FlatbedServer
+local FlatbedServer = {}
+
+-- State Management
+local trucks = {}
+local ropeDefs = {}
+local playerLimits = {}
+
+-- Rate Limiting
+local RATE_LIMIT = {
+    attachment = 1000,  -- 1 second
+    armPosition = 100,  -- 0.1 second
+    rope = 2000         -- 2 seconds
+}
+
+-- Utility Functions
+local function validateEntity(entity)
+    return entity and DoesEntityExist(entity)
+end
+
+local function validateSource(source)
+    return source and GetPlayerPing(source) >= 0
+end
+
+local function isRateLimited(source, action)
+    local now = GetGameTimer()
+    if not playerLimits[source] then
+        playerLimits[source] = {}
+    end
+    
+    local lastAction = playerLimits[source][action] or 0
+    if now - lastAction < RATE_LIMIT[action] then
+        return true
+    end
+    
+    playerLimits[source][action] = now
+    return false
+end
+
+local function createTruckData(truckId)
+    if not trucks[truckId] then
+        trucks[truckId] = {
+            arm = 0.1,
+            bedslide = 0.1,
+            bedslide2 = 0.1,
+            attached = false,
+            owner = nil,
+            created = GetGameTimer()
+        }
+    end
+    return trucks[truckId]
+end
+
+local function cleanupTruck(truckId)
+    trucks[truckId] = nil
+    -- Clean up associated ropes
+    for i = #ropeDefs, 1, -1 do
+        if ropeDefs[i].vehicleTow == truckId then
+            table.remove(ropeDefs, i)
+        end
+    end
+end
+
+local function broadcastTruckUpdate(truckId, truckData)
+    TriggerClientEvent('flatbed:syncTrucks', -1, {[truckId] = truckData})
+end
+
+-- Event Handlers
+RegisterServerEvent('flatbed:saveAttachment')
+AddEventHandler('flatbed:saveAttachment', function(truckId, status)
+    local source = source
+    if not validateSource(source) then return end
+    if isRateLimited(source, 'attachment') then return end
+    
+    -- Validate truck entity
+    if not validateEntity(truckId) then
+        if trucks[truckId] then
+            cleanupTruck(truckId)
+        end
+        return
+    end
+    
+    -- Server-side validation: check if player is near the truck
+    local playerPed = GetPlayerPed(source)
+    local playerCoords = GetEntityCoords(playerPed)
+    local truckCoords = GetEntityCoords(truckId)
+    
+    if #(playerCoords - truckCoords) > 10.0 then
+        print(('Player %d attempted to attach vehicle from distance %.2f'):format(source, #(playerCoords - truckCoords)))
+        return
+    end
+    
+    local truckData = createTruckData(truckId)
+    truckData.attached = status
+    truckData.owner = source
+    
+    broadcastTruckUpdate(truckId, truckData)
+    
+    if config.debugMode then
+        print(('Truck %d attachment status: %s by player %d'):format(truckId, tostring(status), source))
+    end
+end)
+
+RegisterServerEvent('flatbed:saveArmPosition')
+AddEventHandler('flatbed:saveArmPosition', function(truckId, position)
+    local source = source
+    if not validateSource(source) then return end
+    if isRateLimited(source, 'armPosition') then return end
+    
+    -- Validate truck entity
+    if not validateEntity(truckId) then
+        if trucks[truckId] then
+            cleanupTruck(truckId)
+        end
+        return
+    end
+    
+    -- Validate position range
+    if type(position) ~= 'number' or position < 0.0 or position > 0.5 then
+        print(('Invalid arm position from player %d: %s'):format(source, tostring(position)))
+        return
+    end
+    
+    -- Server-side validation: check if player is near the truck
+    local playerPed = GetPlayerPed(source)
+    local playerCoords = GetEntityCoords(playerPed)
+    local truckCoords = GetEntityCoords(truckId)
+    
+    if #(playerCoords - truckCoords) > 10.0 then
+        return
+    end
+    
+    local truckData = createTruckData(truckId)
+    local playerInTruck = GetVehiclePedIsIn(playerPed, false) == truckId
+    
+    if playerInTruck then
+        truckData.bedslide = position
+    else
+        truckData.bedslide2 = position  
+    end
+    
+    truckData.arm = position
+    truckData.owner = source
+    
+    broadcastTruckUpdate(truckId, truckData)
+end)
+
+RegisterServerEvent('flatbed:createRope')
+AddEventHandler('flatbed:createRope', function(vehNetId, playerId)
+    local source = source
+    if not validateSource(source) then return end
+    if isRateLimited(source, 'rope') then return end
+    
+    local playerPed = NetworkGetEntityFromNetworkId(playerId)
+    local entityVeh = NetworkGetEntityFromNetworkId(vehNetId)
+    
+    -- Validate entities
+    if not validateEntity(playerPed) or not validateEntity(entityVeh) then
+        return
+    end
+    
+    -- Validate player owns the ped
+    if GetPlayerPed(source) ~= playerPed then
+        print(('Player %d attempted to create rope with invalid ped'):format(source))
+        return
+    end
+    
+    local playerCoords = GetEntityCoords(playerPed)
+    local vehCoords = GetEntityCoords(entityVeh)
+    
+    -- Distance validation
+    if #(playerCoords - vehCoords) > 20.0 then
+        return
+    end
+    
+    local ropeData = {
+        vehicleTow = entityVeh,
+        vehCoords = vehCoords,
+        playerCoords = playerCoords,
+        caller = playerId,
+        source = source,
+        created = GetGameTimer()
+    }
+    
+    table.insert(ropeDefs, ropeData)
+    TriggerClientEvent('flatbed:createRopeClient', -1, playerId, vehNetId, playerCoords, vehCoords)
+    
+    if config.debugMode then
+        print(('Rope created by player %d for vehicle %d'):format(source, vehNetId))
+    end
+end)
+
+RegisterServerEvent('flatbed:finalizeRope')
+AddEventHandler('flatbed:finalizeRope', function(closestVehId, attachedVehicleId, ropeCoords)
+    local source = source
+    if not validateSource(source) then return end
+    
+    local closestVeh = NetworkGetEntityFromNetworkId(closestVehId)
+    local attachedVehicle = NetworkGetEntityFromNetworkId(attachedVehicleId)
+    
+    -- Validate entities
+    if not validateEntity(closestVeh) or not validateEntity(attachedVehicle) then
+        return
+    end
+    
+    -- Validate player proximity
+    local playerPed = GetPlayerPed(source)
+    local playerCoords = GetEntityCoords(playerPed)
+    local vehCoords = GetEntityCoords(closestVeh)
+    
+    if #(playerCoords - vehCoords) > 15.0 then
+        return
+    end
+    
+    TriggerClientEvent('flatbed:finalizeRopeClient', -1, closestVehId, attachedVehicleId, ropeCoords)
+    
+    -- Clean up rope data
+    for i = #ropeDefs, 1, -1 do
+        if ropeDefs[i].vehicleTow == attachedVehicle then
+            table.remove(ropeDefs, i)
+        end
+    end
+end)
+
+RegisterServerEvent('flatbed:removeRope')
+AddEventHandler('flatbed:removeRope', function(vehicleId)
+    local source = source
+    if not validateSource(source) then return end
+    
+    TriggerClientEvent('flatbed:removeRopeClient', -1, vehicleId)
+    
+    -- Clean up rope data
+    for i = #ropeDefs, 1, -1 do
+        local rope = ropeDefs[i]
+        if rope.vehicleTow == vehicleId and rope.source == source then
+            table.remove(ropeDefs, i)
+            break
+        end
+    end
+end)
+
+-- Player cleanup
+AddEventHandler('playerDropped', function(reason)
+    local source = source
+    playerLimits[source] = nil
+    
+    -- Clean up abandoned trucks
+    for truckId, truckData in pairs(trucks) do
+        if truckData.owner == source then
+            if not validateEntity(truckId) then
+                cleanupTruck(truckId)
+            else
+                -- Reset ownership but keep data
+                truckData.owner = nil
+            end
+        end
+    end
+    
+    -- Clean up ropes
+    for i = #ropeDefs, 1, -1 do
+        if ropeDefs[i].source == source then
+            table.remove(ropeDefs, i)
+        end
+    end
+end)
+
+-- Periodic cleanup
+CreateThread(function()
+    while true do
+        Wait(60000) -- Every minute
+        
+        local now = GetGameTimer()
+        local cleaned = 0
+        
+        -- Clean up old trucks that no longer exist
+        for truckId, truckData in pairs(trucks) do
+            if

@@ -1,0 +1,216 @@
+-- Vehicle Bone Inspector for FiveM
+-- Press F9 to toggle bone inspection mode
+-- Aim at vehicle bones and press ENTER to copy bone name to clipboard
+
+local inspectionMode = false
+local currentVehicle = nil
+local closestBone = nil
+local boneMarkers = {}
+
+-- Get all bone names for a vehicle
+local function getAllBones(vehicle)
+    local bones = {}
+    local boneCount = GetEntityBoneCount(vehicle)
+    
+    for i = 0, boneCount - 1 do
+        local boneName = GetEntityBoneName(vehicle, i)
+        if boneName and boneName ~= "" then
+            table.insert(bones, {
+                index = i,
+                name = boneName,
+                coords = GetWorldPositionOfEntityBone(vehicle, i)
+            })
+        end
+    end
+    
+    return bones
+end
+
+-- Find closest bone to raycast hit point
+local function getClosestBone(vehicle, hitCoords)
+    local bones = getAllBones(vehicle)
+    local closestBone = nil
+    local closestDistance = math.huge
+    
+    for _, bone in ipairs(bones) do
+        local distance = #(hitCoords - bone.coords)
+        if distance < closestDistance then
+            closestDistance = distance
+            closestBone = bone
+        end
+    end
+    
+    return closestBone, closestDistance
+end
+
+-- Draw 3D text
+local function drawText3D(coords, text, scale)
+    local onScreen, x, y = World3dToScreen2d(coords.x, coords.y, coords.z)
+    if onScreen then
+        SetTextScale(scale or 0.4, scale or 0.4)
+        SetTextFont(4)
+        SetTextProportional(1)
+        SetTextColour(255, 255, 255, 255)
+        SetTextEntry("STRING")
+        SetTextCentre(1)
+        AddTextComponentString(text)
+        DrawText(x, y)
+    end
+end
+
+-- Copy to clipboard (FiveM doesn't have native clipboard, so we'll print it)
+local function copyBoneName(boneName)
+    -- Print to console for copying
+    print("^2[BONE INSPECTOR]^7 Bone name: " .. boneName)
+    
+    -- Show notification
+    BeginTextCommandThefeedPost("STRING")
+    AddTextComponentSubstringPlayerName("Bone name copied: " .. boneName)
+    EndTextCommandThefeedPostTicker(false, true)
+    
+    -- Alternative: Send to chat for easy copying
+    TriggerEvent('chat:addMessage', {
+        color = {0, 255, 0},
+        multiline = true,
+        args = {"Bone Inspector", "Bone name: " .. boneName}
+    })
+end
+
+-- Main inspection thread
+CreateThread(function()
+    while true do
+        Wait(0)
+        
+        -- Toggle inspection mode
+        if IsControlJustPressed(0, 56) then -- F9
+            inspectionMode = not inspectionMode
+            currentVehicle = nil
+            closestBone = nil
+            
+            local status = inspectionMode and "ENABLED" or "DISABLED"
+            BeginTextCommandThefeedPost("STRING")
+            AddTextComponentSubstringPlayerName("Bone Inspector " .. status)
+            EndTextCommandThefeedPostTicker(false, true)
+        end
+        
+        if not inspectionMode then
+            goto continue
+        end
+        
+        local playerPed = PlayerPedId()
+        local playerCoords = GetEntityCoords(playerPed)
+        local camCoords = GetGameplayCamCoords()
+        local camRot = GetGameplayCamRot(2)
+        
+        -- Calculate raycast direction
+        local direction = RotationToDirection(camRot)
+        local endCoords = camCoords + (direction * 100.0)
+        
+        -- Perform raycast
+        local rayHandle = StartExpensiveSynchronousShapeTestLosProbe(
+            camCoords.x, camCoords.y, camCoords.z,
+            endCoords.x, endCoords.y, endCoords.z,
+            10, -- Vehicle flag
+            playerPed,
+            0
+        )
+        
+        local _, hit, hitCoords, _, hitEntity = GetShapeTestResult(rayHandle)
+        
+        if hit and hitEntity and IsEntityAVehicle(hitEntity) then
+            currentVehicle = hitEntity
+            
+            -- Find closest bone to hit point
+            local bone, distance = getClosestBone(hitEntity, hitCoords)
+            
+            if bone and distance < 2.0 then -- Within 2 units
+                closestBone = bone
+                
+                -- Draw bone marker
+                DrawMarker(
+                    28, -- Sphere marker
+                    bone.coords.x, bone.coords.y, bone.coords.z,
+                    0.0, 0.0, 0.0,
+                    0.0, 0.0, 0.0,
+                    0.3, 0.3, 0.3,
+                    255, 0, 0, 150,
+                    false, true, 2, false, nil, nil, false
+                )
+                
+                -- Draw bone name
+                drawText3D(bone.coords + vector3(0, 0, 0.5), bone.name, 0.5)
+                drawText3D(bone.coords + vector3(0, 0, 0.3), "Index: " .. bone.index, 0.3)
+                
+                -- Copy bone name on ENTER
+                if IsControlJustPressed(0, 191) then -- ENTER
+                    copyBoneName(bone.name)
+                end
+            else
+                closestBone = nil
+            end
+        else
+            currentVehicle = nil
+            closestBone = nil
+        end
+        
+        -- Draw instructions
+        if inspectionMode then
+            drawText3D(playerCoords + vector3(0, 0, 2.0), "~g~Bone Inspector Active", 0.6)
+            drawText3D(playerCoords + vector3(0, 0, 1.7), "Aim at vehicle bones", 0.4)
+            drawText3D(playerCoords + vector3(0, 0, 1.4), "Press ENTER to copy bone name", 0.4)
+            drawText3D(playerCoords + vector3(0, 0, 1.1), "Press F9 to disable", 0.4)
+            
+            if closestBone then
+                drawText3D(playerCoords + vector3(0, 0, 0.8), "~y~" .. closestBone.name, 0.5)
+            end
+        end
+        
+        ::continue::
+    end
+end)
+
+-- Helper function to convert rotation to direction vector
+function RotationToDirection(rotation)
+    local adjustedRotation = vector3(
+        (math.pi / 180) * rotation.x,
+        (math.pi / 180) * rotation.y,
+        (math.pi / 180) * rotation.z
+    )
+    
+    local direction = vector3(
+        -math.sin(adjustedRotation.z) * math.abs(math.cos(adjustedRotation.x)),
+        math.cos(adjustedRotation.z) * math.abs(math.cos(adjustedRotation.x)),
+        math.sin(adjustedRotation.x)
+    )
+    
+    return direction
+end
+
+-- Show all bones command (optional)
+RegisterCommand('showbones', function()
+    local playerPed = PlayerPedId()
+    local vehicle = GetVehiclePedIsIn(playerPed, false)
+    
+    if vehicle == 0 then
+        vehicle = GetClosestVehicle(GetEntityCoords(playerPed), 10.0, 0, 70)
+    end
+    
+    if vehicle ~= 0 then
+        local bones = getAllBones(vehicle)
+        print("^2[BONE INSPECTOR]^7 Vehicle bones (" .. #bones .. " total):")
+        
+        for _, bone in ipairs(bones) do
+            print("  Index: " .. bone.index .. " | Name: " .. bone.name)
+        end
+        
+        BeginTextCommandThefeedPost("STRING")
+        AddTextComponentSubstringPlayerName("Bone list printed to console (" .. #bones .. " bones)")
+        EndTextCommandThefeedPostTicker(false, true)
+    else
+        BeginTextCommandThefeedPost("STRING")
+        AddTextComponentSubstringPlayerName("No vehicle found nearby")
+        EndTextCommandThefeedPostTicker(false, true)
+    end
+end)
+
+print("^2[BONE INSPECTOR]^7 Loaded! Press F9 to toggle inspection mode.")

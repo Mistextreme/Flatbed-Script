@@ -1,0 +1,73 @@
+---@class FlatbedConfig
+config = {
+    -- Vehicle Models
+    flatbed_name = {
+        "f550rb",
+        "f550rbc", 
+        "16ramrb",
+        "16ramrbc",
+        "20ramrb",
+        "20ramrbc"
+    },
+    
+    -- Controls
+    carAttach = 305, -- B key
+    bedExtend = 111, -- 5 key  
+    bedRetract = 112, -- 8 key
+    takeWinchCable = 108, -- 4 key
+    attachWinchToVehicle = 109, -- 6 key
+    
+    -- Performance Settings
+    maxInteractionDistance = 5.0,
+    controlDistance = 2.0,
+    updateInterval = 100, -- ms
+    slidingSpeed = 20,
+    
+    -- Bed Limits
+    bedMinPosition = 0.1,
+    bedMaxPosition = 0.3,
+    bedStep = 0.005,
+    
+    -- UI Settings
+    useFloatingText = true,
+    textScale = 0.35,
+    textFont = 4,
+    
+    -- Text Configuration
+    text = {
+        controlBasic = "[~y~5~w~] raise bed ~r~-~w~ [~y~8~w~] lower bed",
+        controlWithWinch = "[~y~5~w~] raise bed ~r~-~w~ [~y~4~w~] take Winch Cable ~r~-~w~[~g~Safe to Attach/Detach~w~]",
+        controlCarryingWinch = "[~y~5~w~] raise bed ~r~-~w~ [~y~4~w~] remove Winch Cable ~r~-~w~[~g~Safe to Attach/Detach~w~]",
+        carAttachLabel = "Press ~INPUT_REPLAY_STARTPOINT~ to attach entity.",
+        carDetachLabel = "Press ~INPUT_REPLAY_STARTPOINT~ to detach entity.",
+        ropeText = "[~y~6~w~] attach winch to closest Vehicle",
+        
+        -- Label versions
+        labelBasic = "[~y~5~w~] raise bed ~r~-~w~ [~y~8~w~] lower bed",
+        labelWithWinch = "[~y~5~w~] raise bed ~r~-~w~ [~y~4~w~] take Winch Cable ~n~~w~[~g~Safe to Attach/Detach~w~]",
+        labelCarryingWinch = "[~y~5~w~] raise bed ~r~-~w~ [~y~4~w~] remove Winch Cable ~n~~w~[~g~Safe to Attach/Detach~w~]"
+    },
+    
+    -- Sound Settings
+    sounds = {
+        hydraulicsDown = 'Hydraulics_Down',
+        hydraulicsUp = 'Hydraulics_Up',
+        soundSet = 'Lowrider_Super_Mod_Garage_Sounds'
+    },
+    
+    -- Attachment Settings
+    attachmentOffset = {
+        x = 0.0,
+        y = 0.0,
+        z = 0.08
+    },
+    
+    -- Rope Settings
+    ropeLength = 30.0,
+    ropeType = 2,
+    maxLength = 25.0,
+    windingForce = 1.0,
+    
+    -- Debug
+    debugMode = false
+}

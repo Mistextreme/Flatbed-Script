@@ -1,0 +1,397 @@
+---@class FlatbedClient
+local FlatbedClient = {}
+
+-- State Management
+local state = {
+    lastTruck = 0,
+    lastVeh = 0,
+    lastTruckCoords = vector3(0, 0, 0),
+    bedPosition = 0.1,
+    extended = false,
+    attached = false,
+    carryingRope = false,
+    attachedVehicle = nil,
+    ropeCoords = nil,
+    nearFlatbed = false,
+    inFlatbed = false
+}
+
+-- Cache
+local cache = {
+    playerPed = 0,
+    currentVehicle = 0,
+    position = vector3(0, 0, 0),
+    flatbedHashes = {},
+    trucks = {},
+    ropeSaver = {},
+    lastUpdate = 0
+}
+
+-- Initialize flatbed hashes
+local function initializeFlatbedHashes()
+    for _, modelName in ipairs(config.flatbed_name) do
+        cache.flatbedHashes[GetHashKey(modelName)] = true
+    end
+end
+
+-- Utility Functions
+local function isFlatbed(vehicleModel)
+    return cache.flatbedHashes[vehicleModel] ~= nil
+end
+
+local function updateCache()
+    local currentTime = GetGameTimer()
+    if currentTime - cache.lastUpdate < config.updateInterval then
+        return false
+    end
+    
+    cache.lastUpdate = currentTime
+    cache.playerPed = PlayerPedId()
+    cache.currentVehicle = GetVehiclePedIsIn(cache.playerPed, false)
+    cache.position = GetEntityCoords(cache.playerPed)
+    return true
+end
+
+local function drawText3D(coords, text)
+    local onScreen, screenX, screenY = World3dToScreen2d(coords.x, coords.y, coords.z)
+    if not onScreen then return end
+    
+    local camCoords = GetGameplayCamCoords()
+    local distance = #(camCoords - coords)
+    local scale = (1 / distance) * 2
+    local fov = (1 / GetGameplayCamFov()) * 100
+    scale = scale * fov
+    
+    SetTextScale(config.textScale, config.textScale)
+    SetTextFont(config.textFont)
+    SetTextProportional(1)
+    SetTextColour(255, 255, 255, 215)
+    SetTextEntry("STRING")
+    SetTextCentre(1)
+    AddTextComponentString(text)
+    DrawText(screenX, screenY)
+    
+    local factor = string.len(text) / 370
+    DrawRect(screenX, screenY + 0.0125, 0.015 + factor, 0.03, 18, 18, 18, 170)
+end
+
+local function playHydraulicSound(soundName)
+    if state.lastTruck ~= 0 then
+        PlaySoundFromEntity(-1, soundName, state.lastTruck, config.sounds.soundSet, 0, 0)
+    end
+end
+
+local function setBedPosition(position, final)
+    if state.lastTruck ~= 0 then
+        SetVehicleBulldozerArmPosition(state.lastTruck, position, false)
+        if final then
+            TriggerServerEvent('flatbed:saveArmPosition', state.lastTruck, position)
+        end
+    end
+end
+
+-- Bed Control Functions
+local function extendBed()
+    if state.bedPosition < config.bedMaxPosition then
+        state.bedPosition = math.min(state.bedPosition + config.bedStep, config.bedMaxPosition)
+        state.extended = false
+        playHydraulicSound(config.sounds.hydraulicsDown)
+        setBedPosition(state.bedPosition, false)
+    else
+        state.bedPosition = config.bedMaxPosition
+        state.extended = true
+    end
+end
+
+local function retractBed()
+    state.extended = false
+    if state.bedPosition > config.bedMinPosition then
+        state.bedPosition = math.max(state.bedPosition - config.bedStep, config.bedMinPosition)
+        playHydraulicSound(config.sounds.hydraulicsUp)
+        setBedPosition(state.bedPosition, false)
+    else
+        state.bedPosition = config.bedMinPosition
+        setBedPosition(state.inFlatbed and 0.02 or 0.0, false)
+    end
+end
+
+-- Rope System
+local function startRope()
+    if state.lastTruck == 0 then return end
+    
+    if not state.carryingRope then
+        state.attachedVehicle = NetworkGetNetworkIdFromEntity(state.lastTruck)
+        TriggerServerEvent('flatbed:createRope', NetworkGetNetworkIdFromEntity(state.lastTruck), NetworkGetNetworkIdFromEntity(cache.playerPed))
+        
+        BeginTextCommandDisplayHelp("STRING")
+        AddTextComponentString(config.text.ropeText)
+        EndTextCommandDisplayHelp(0, false, true, -1)
+        
+        state.carryingRope = true
+    else
+        TriggerServerEvent('flatbed:removeRope', state.attachedVehicle)
+        state.carryingRope = false
+    end
+end
+
+local function attachRopeToVehicle()
+    if not state.carryingRope then return end
+    
+    local closestVeh = GetClosestVehicle(cache.position, 10.0, 0, 70)
+    if closestVeh ~= 0 then
+        TriggerServerEvent('flatbed:finalizeRope', NetworkGetNetworkIdFromEntity(closestVeh), state.attachedVehicle, state.ropeCoords)
+    end
+end
+
+-- Vehicle Attachment System
+local function handleVehicleAttachment()
+    if not cache.currentVehicle or cache.currentVehicle == 0 then return end
+    
+    if IsEntityAttached(cache.currentVehicle) then
+        BeginTextCommandDisplayHelp("STRING")
+        AddTextComponentString(config.text.carDetachLabel)
+        EndTextCommandDisplayHelp(0, false, true, -1)
+        
+        if IsControlJustReleased(0, config.carAttach) then
+            DetachEntity(cache.currentVehicle, true, true)
+            state.attached = false
+            TriggerServerEvent('flatbed:saveAttachment', state.lastTruck, false)
+        end
+    else
+        -- Check for nearby flatbed
+        local rayHandle = StartExpensiveSynchronousShapeTestLosProbe(
+            cache.position.x, cache.position.y, cache.position.z,
+            cache.position.x, cache.position.y + 6.0, cache.position.z - 5.0,
+            10, cache.currentVehicle, 0
+        )
+        local _, hit, _, _, vehicleHandle = GetShapeTestResult(rayHandle)
+        
+        if hit and vehicleHandle and isFlatbed(GetEntityModel(vehicleHandle)) then
+            BeginTextCommandDisplayHelp("STRING")
+            AddTextComponentString(config.text.carAttachLabel)
+            EndTextCommandDisplayHelp(0, false, true, -1)
+            
+            if IsControlJustReleased(0, config.carAttach) then
+                local boneIndex = GetEntityBoneIndexByName(vehicleHandle, "misc_z")
+                local vehicleHeightMin = GetModelDimensions(GetEntityModel(cache.currentVehicle))
+                
+                AttachEntityToEntity(
+                    cache.currentVehicle, vehicleHandle, boneIndex,
+                    config.attachmentOffset.x, config.attachmentOffset.y, 
+                    config.attachmentOffset.z - vehicleHeightMin,
+                    2.0, 0, 0, 1, 1, 1, 1, 0, 1
+                )
+                
+                state.attached = true
+                TriggerServerEvent('flatbed:saveAttachment', vehicleHandle, true)
+            end
+        end
+    end
+end
+
+-- Control Handlers
+local function handleFlatbedControls()
+    if not state.nearFlatbed then return end
+    
+    local markerCoords = GetOffsetFromEntityInWorldCoords(state.lastTruck, -1.2, -4.75, 0.0)
+    local distance = #(cache.position - markerCoords)
+    
+    if distance > config.maxInteractionDistance then
+        state.nearFlatbed = false
+        return
+    end
+    
+    -- Display UI
+    local text = config.text.controlBasic
+    if state.extended then
+        text = state.carryingRope and config.text.controlCarryingWinch or config.text.controlWithWinch
+    end
+    
+    if config.useFloatingText then
+        drawText3D(markerCoords, text)
+    else
+        BeginTextCommandDisplayHelp("STRING")
+        AddTextComponentString(state.extended and (state.carryingRope and config.text.labelCarryingWinch or config.text.labelWithWinch) or config.text.labelBasic)
+        EndTextCommandDisplayHelp(0, false, true, -1)
+    end
+    
+    -- Handle rope attachment
+    if IsControlJustReleased(0, config.attachWinchToVehicle) and state.carryingRope then
+        attachRopeToVehicle()
+    end
+    
+    -- Handle controls when close enough
+    if distance < config.controlDistance then
+        -- Load saved position
+        if (IsControlJustPressed(0, config.bedExtend) or IsControlJustPressed(0, config.bedRetract)) then
+            if cache.trucks[state.lastTruck] and cache.trucks[state.lastTruck].bedslide2 then
+                state.bedPosition = cache.trucks[state.lastTruck].bedslide2
+            end
+        end
+        
+        -- Bed controls
+        if IsControlPressed(0, config.bedExtend) then
+            extendBed()
+        elseif IsControlPressed(0, config.bedRetract) and state.bedPosition > config.bedMinPosition then
+            retractBed()
+        end
+        
+        -- Save position on release
+        if IsControlJustReleased(0, config.bedExtend) or IsControlJustReleased(0, config.bedRetract) then
+            setBedPosition(state.bedPosition, true)
+        end
+        
+        -- Rope control
+        if IsControlJustReleased(0, config.takeWinchCable) then
+            startRope()
+        end
+    end
+end
+
+local function handleInVehicleControls()
+    if not state.inFlatbed then return end
+    
+    -- Load saved position
+    if IsControlJustPressed(0, config.bedExtend) or IsControlJustPressed(0, config.bedRetract) or 
+       IsControlJustPressed(0, 21) or IsControlJustPressed(0, 36) then
+        if cache.trucks[state.lastTruck] and cache.trucks[state.lastTruck].bedslide then
+            state.bedPosition = cache.trucks[state.lastTruck].bedslide
+        end
+    end
+    
+    -- Bed controls
+    if IsControlPressed(0, config.bedExtend) or IsControlPressed(0, 21) then
+        extendBed()
+    elseif (IsControlPressed(0, config.bedRetract) or IsControlPressed(0, 36)) and state.bedPosition > config.bedMinPosition then
+        retractBed()
+    end
+    
+    -- Save position on release
+    if IsControlJustReleased(0, config.bedExtend) or IsControlJustReleased(0, config.bedRetract) then
+        setBedPosition(state.bedPosition, true)
+    end
+end
+
+-- Main Threads
+local function mainThread()
+    while true do
+        if not updateCache() then
+            Wait(config.updateInterval)
+            goto continue
+        end
+        
+        -- Update vehicle states
+        local currentVeh = GetVehiclePedIsIn(cache.playerPed, true)
+        if currentVeh ~= 0 and isFlatbed(GetEntityModel(currentVeh)) then
+            state.lastTruck = currentVeh
+            state.lastTruckCoords = GetEntityCoords(state.lastTruck)
+            state.inFlatbed = (cache.currentVehicle == currentVeh)
+        elseif currentVeh ~= 0 then
+            state.lastVeh = currentVeh
+            state.inFlatbed = false
+        end
+        
+        -- Check proximity to flatbed
+        if state.lastTruck ~= 0 and not IsPedInAnyVehicle(cache.playerPed, false) then
+            local markerCoords = GetOffsetFromEntityInWorldCoords(state.lastTruck, -1.2, -4.75, 0.0)
+            state.nearFlatbed = (#(cache.position - markerCoords) < config.maxInteractionDistance)
+        else
+            state.nearFlatbed = false
+        end
+        
+        -- Freeze truck when bed extended
+        if state.lastTruck ~= 0 then
+            FreezeEntityPosition(state.lastTruck, state.extended)
+        end
+        
+        ::continue::
+        Wait(config.updateInterval)
+    end
+end
+
+local function controlThread()
+    while true do
+        Wait(0)
+        
+        if state.inFlatbed then
+            handleInVehicleControls()
+        elseif state.nearFlatbed then
+            handleFlatbedControls()
+        elseif IsPedInAnyVehicle(cache.playerPed, false) then
+            handleVehicleAttachment()
+        end
+    end
+end
+
+-- Event Handlers
+RegisterNetEvent('flatbed:syncTrucks', function(truckData)
+    cache.trucks = truckData
+end)
+
+RegisterNetEvent('flatbed:createRopeClient', function(playerId, entityVeh, playerCoords, vehCoords)
+    local playerPed = NetworkGetEntityFromNetworkId(playerId)
+    local vehicle = NetworkGetEntityFromNetworkId(entityVeh)
+    
+    RopeLoadTextures()
+    local rope = AddRope(playerCoords, 0.0, 0.0, 0.0, config.ropeLength, config.ropeType, config.maxLength, config.windingForce, 0, 0, 0, 0, 0, 0, 0)
+    cache.ropeSaver[entityVeh] = rope
+    
+    local boneIndex = GetEntityBoneIndexByName(vehicle, "misc_z")
+    state.ropeCoords = GetWorldPositionOfEntityBone(vehicle, boneIndex)
+    AttachRopeToEntity(rope, vehicle, state.ropeCoords, 1)
+    AttachEntitiesToRope(rope, vehicle, playerPed, state.ropeCoords, playerCoords, 100)
+end)
+
+RegisterNetEvent('flatbed:removeRopeClient', function(entityVeh)
+    if cache.ropeSaver[entityVeh] then
+        DeleteRope(cache.ropeSaver[entityVeh])
+        cache.ropeSaver[entityVeh] = nil
+    end
+end)
+
+RegisterNetEvent('flatbed:finalizeRopeClient', function(closestVehId, attachedVehicleId, ropeCoords)
+    local closestVeh = NetworkGetEntityFromNetworkId(closestVehId)
+    local attachedVehicle = NetworkGetEntityFromNetworkId(attachedVehicleId)
+    local boneIndex = GetEntityBoneIndexByName(attachedVehicle, "misc_z")
+    
+    if cache.ropeSaver[attachedVehicleId] then
+        local rope = cache.ropeSaver[attachedVehicleId]
+        local bonnetBone = GetEntityBoneIndexByName(closestVeh, "bonnet")
+        
+        AttachEntitiesToRope(rope, attachedVehicle, closestVeh, ropeCoords, GetWorldPositionOfEntityBone(closestVeh, bonnetBone), 100)
+        DetachRopeFromEntity(rope, cache.playerPed)
+        StartRopeWinding(rope)
+        FreezeEntityPosition(attachedVehicle, true)
+        
+        -- Wind the rope
+        CreateThread(function()
+            while RopeGetDistanceBetweenEnds(rope) >= 1.05 do
+                RopeForceLength(rope, RopeGetDistanceBetweenEnds(rope) - 0.1)
+                Wait(50)
+            end
+            
+            local vehicleHeightMin = GetModelDimensions(GetEntityModel(closestVeh))
+            FreezeEntityPosition(attachedVehicle, false)
+            AttachEntityToEntity(
+                closestVeh, attachedVehicle, boneIndex,
+                config.attachmentOffset.x, config.attachmentOffset.y,
+                config.attachmentOffset.z - vehicleHeightMin,
+                2.0, 0, 0, 1, 1, 1, 1, 0, 1
+            )
+            
+            DeleteRope(rope)
+            cache.ropeSaver[attachedVehicleId] = nil
+            state.carryingRope = false
+            state.attached = true
+            TriggerServerEvent('flatbed:saveAttachment', attachedVehicleId, true)
+        end)
+    end
+end)
+
+-- Initialization
+CreateThread(function()
+    initializeFlatbedHashes()
+    mainThread()
+end)
+
+CreateThread(controlThread)

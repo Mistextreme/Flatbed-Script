@@ -1,0 +1,384 @@
+---@class FlatbedServer
+local FlatbedServer = {}
+
+-- State Management
+local trucks = {}
+local ropes = {}
+local playerCooldowns = {}
+
+-- Constants
+local COOLDOWN_TIME = 1000 -- 1 second cooldown for spam prevention
+local MAX_ROPE_DISTANCE = 15.0
+local CLEANUP_INTERVAL = 300000 -- 5 minutes
+
+-- Utility Functions
+local function validateEntity(entity)
+    return entity and DoesEntityExist(entity)
+end
+
+local function validatePlayer(source)
+    return source and GetPlayerPed(source) ~= 0
+end
+
+local function isOnCooldown(source, action)
+    local key = source .. '_' .. action
+    local currentTime = GetGameTimer()
+    
+    if playerCooldowns[key] and (currentTime - playerCooldowns[key]) < COOLDOWN_TIME then
+        return true
+    end
+    
+    playerCooldowns[key] = currentTime
+    return false
+end
+
+local function createTruckData(truckId)
+    if not trucks[truckId] then
+        trucks[truckId] = {
+            arm = 0.1,
+            bedslide = 0.1,
+            bedslide2 = 0.1,
+            attached = false,
+            owner = nil,
+            lastUpdate = GetGameTimer()
+        }
+    end
+    return trucks[truckId]
+end
+
+local function cleanupTruck(truckId)
+    trucks[truckId] = nil
+    
+    -- Cleanup associated ropes
+    for ropeId, ropeData in pairs(ropes) do
+        if ropeData.vehicleTow == truckId then
+            ropes[ropeId] = nil
+        end
+    end
+end
+
+local function validateDistance(source, targetEntity, maxDistance)
+    if not validatePlayer(source) or not validateEntity(targetEntity) then
+        return false
+    end
+    
+    local playerPed = GetPlayerPed(source)
+    local playerCoords = GetEntityCoords(playerPed)
+    local targetCoords = GetEntityCoords(targetEntity)
+    
+    return #(playerCoords - targetCoords) <= maxDistance
+end
+
+-- Event Handlers
+RegisterNetEvent('flatbed:saveAttachment', function(truckId, status)
+    local source = source
+    
+    if not validatePlayer(source) then
+        return
+    end
+    
+    if isOnCooldown(source, 'attachment') then
+        return
+    end
+    
+    local truck = NetworkGetEntityFromNetworkId(truckId)
+    
+    if validateEntity(truck) then
+        local truckData = createTruckData(truckId)
+        truckData.attached = status
+        truckData.owner = source
+        truckData.lastUpdate = GetGameTimer()
+        
+        -- Sync to all clients
+        TriggerClientEvent('flatbed:syncTrucks', -1, trucks)
+        
+        if config.debugMode then
+            print(('[Flatbed] Player %d %s vehicle to truck %d'):format(source, status and 'attached' or 'detached', truckId))
+        end
+    else
+        -- Clean up if truck no longer exists
+        cleanupTruck(truckId)
+    end
+end)
+
+RegisterNetEvent('flatbed:saveArmPosition', function(truckId, position)
+    local source = source
+    
+    if not validatePlayer(source) then
+        return
+    end
+    
+    if isOnCooldown(source, 'arm_position') then
+        return
+    end
+    
+    local truck = NetworkGetEntityFromNetworkId(truckId)
+    
+    if validateEntity(truck) then
+        -- Validate position range
+        if position < 0.0 or position > 1.0 then
+            return
+        end
+        
+        local truckData = createTruckData(truckId)
+        truckData.arm = position
+        truckData.bedslide = position
+        truckData.bedslide2 = position
+        truckData.owner = source
+        truckData.lastUpdate = GetGameTimer()
+        
+        -- Sync to all clients
+        TriggerClientEvent('flatbed:syncTrucks', -1, trucks)
+        
+        if config.debugMode then
+            print(('[Flatbed] Player %d set truck %d bed position to %.3f'):format(source, truckId, position))
+        end
+    else
+        cleanupTruck(truckId)
+    end
+end)
+
+RegisterNetEvent('flatbed:createRope', function(vehicleNetId, playerNetId)
+    local source = source
+    
+    if not validatePlayer(source) then
+        return
+    end
+    
+    if isOnCooldown(source, 'create_rope') then
+        return
+    end
+    
+    local vehicle = NetworkGetEntityFromNetworkId(vehicleNetId)
+    local player = NetworkGetEntityFromNetworkId(playerNetId)
+    
+    if not validateEntity(vehicle) or not validateEntity(player) then
+        return
+    end
+    
+    -- Validate distance
+    if not validateDistance(source, vehicle, MAX_ROPE_DISTANCE) then
+        return
+    end
+    
+    local playerCoords = GetEntityCoords(player)
+    local vehicleCoords = GetEntityCoords(vehicle)
+    
+    -- Store rope data
+    ropes[vehicleNetId] = {
+        vehicleTow = vehicle,
+        vehicleCoords = vehicleCoords,
+        playerCoords = playerCoords,
+        caller = playerNetId,
+        owner = source,
+        created = GetGameTimer()
+    }
+    
+    -- Trigger client rope creation
+    TriggerClientEvent('flatbed:createRopeClient', -1, playerNetId, vehicleNetId, playerCoords, vehicleCoords)
+    
+    if config.debugMode then
+        print(('[Flatbed] Player %d created rope for vehicle %d'):format(source, vehicleNetId))
+    end
+end)
+
+RegisterNetEvent('flatbed:finalizeRope', function(closestVehId, attachedVehicleId, ropeCoords)
+    local source = source
+    
+    if not validatePlayer(source) then
+        return
+    end
+    
+    if isOnCooldown(source, 'finalize_rope') then
+        return
+    end
+    
+    local closestVeh = NetworkGetEntityFromNetworkId(closestVehId)
+    local attachedVehicle = NetworkGetEntityFromNetworkId(attachedVehicleId)
+    
+    if not validateEntity(closestVeh) or not validateEntity(attachedVehicle) then
+        return
+    end
+    
+    -- Validate distance
+    if not validateDistance(source, closestVeh, MAX_ROPE_DISTANCE) then
+        return
+    end
+    
+    -- Check if rope exists
+    if not ropes[attachedVehicleId] or ropes[attachedVehicleId].owner ~= source then
+        return
+    end
+    
+    -- Trigger client finalization
+    TriggerClientEvent('flatbed:finalizeRopeClient', -1, closestVehId, attachedVehicleId, ropeCoords)
+    
+    -- Update truck attachment status
+    local truckData = createTruckData(attachedVehicleId)
+    truckData.attached = true
+    truckData.owner = source
+    truckData.lastUpdate = GetGameTimer()
+    
+    -- Cleanup rope data
+    ropes[attachedVehicleId] = nil
+    
+    if config.debugMode then
+        print(('[Flatbed] Player %d finalized rope attachment between vehicles %d and %d'):format(source, closestVehId, attachedVehicleId))
+    end
+end)
+
+RegisterNetEvent('flatbed:removeRope', function(vehicleNetId)
+    local source = source
+    
+    if not validatePlayer(source) then
+        return
+    end
+    
+    if isOnCooldown(source, 'remove_rope') then
+        return
+    end
+    
+    -- Check ownership
+    if ropes[vehicleNetId] and ropes[vehicleNetId].owner == source then
+        TriggerClientEvent('flatbed:removeRopeClient', -1, vehicleNetId)
+        ropes[vehicleNetId] = nil
+        
+        if config.debugMode then
+            print(('[Flatbed] Player %d removed rope for vehicle %d'):format(source, vehicleNetId))
+        end
+    end
+end)
+
+-- Player connection handlers
+RegisterNetEvent('playerConnecting', function()
+    local source = source
+    
+    -- Send current truck states to new player
+    if next(trucks) then
+        TriggerClientEvent('flatbed:syncTrucks', source, trucks)
+    end
+end)
+
+AddEventHandler('playerDropped', function(reason)
+    local source = source
+    
+    -- Cleanup player-owned trucks and ropes
+    for truckId, truckData in pairs(trucks) do
+        if truckData.owner == source then
+            trucks[truckId] = nil
+        end
+    end
+    
+    for ropeId, ropeData in pairs(ropes) do
+        if ropeData.owner == source then
+            ropes[ropeId] = nil
+            TriggerClientEvent('flatbed:removeRopeClient', -1, ropeId)
+        end
+    end
+    
+    -- Clear cooldowns
+    for key, _ in pairs(playerCooldowns) do
+        if key:match('^' .. source .. '_') then
+            playerCooldowns[key] = nil
+        end
+    end
+end)
+
+-- Cleanup thread for orphaned data
+CreateThread(function()
+    while true do
+        Wait(CLEANUP_INTERVAL)
+        
+        local currentTime = GetGameTimer()
+        local cleaned = 0
+        
+        -- Cleanup old trucks
+        for truckId, truckData in pairs(trucks) do
+            local truck = NetworkGetEntityFromNetworkId(truckId)
+            if not validateEntity(truck) or (currentTime - truckData.lastUpdate) > CLEANUP_INTERVAL then
+                trucks[truckId] = nil
+                cleaned = cleaned + 1
+            end
+        end
+        
+        -- Cleanup old ropes
+        for ropeId, ropeData in pairs(ropes) do
+            if (currentTime - ropeData.created) > CLEANUP_INTERVAL then
+                ropes[ropeId] = nil
+                TriggerClientEvent('flatbed:removeRopeClient', -1, ropeId)
+                cleaned = cleaned + 1
+            end
+        end
+        
+        -- Cleanup old cooldowns
+        for key, timestamp in pairs(playerCooldowns) do
+            if (currentTime - timestamp) > (COOLDOWN_TIME * 10) then
+                playerCooldowns[key] = nil
+            end
+        end
+        
+        if config.debugMode and cleaned > 0 then
+            print(('[Flatbed] Cleaned up %d orphaned entries'):format(cleaned))
+        end
+    end
+end)
+
+-- Export functions for other resources
+exports('getTruckData', function(truckId)
+    return trucks[truckId]
+end)
+
+exports('getAllTrucks', function()
+    return trucks
+end)
+
+exports('isTruckExtended', function(truckId)
+    local truckData = trucks[truckId]
+    return truckData and truckData.arm > 0.2
+end)
+
+-- Console commands for debugging (if debug mode enabled)
+if config.debugMode then
+    RegisterCommand('flatbed:debug', function(source, args)
+        if source == 0 then -- Console only
+            print('=== Flatbed Debug Info ===')
+            print(('Active trucks: %d'):format(#trucks))
+            print(('Active ropes: %d'):format(#ropes))
+            print(('Active cooldowns: %d'):format(#playerCooldowns))
+            
+            for truckId, truckData in pairs(trucks) do
+                print(('Truck %d: arm=%.3f, attached=%s, owner=%s'):format(
+                    truckId, truckData.arm, tostring(truckData.attached), truckData.owner or 'none'
+                ))
+            end
+        end
+    end, true)
+    
+    RegisterCommand('flatbed:cleanup', function(source, args)
+        if source == 0 then -- Console only
+            trucks = {}
+            ropes = {}
+            playerCooldowns = {}
+            TriggerClientEvent('flatbed:syncTrucks', -1, {})
+            print('Flatbed data cleared')
+        end
+    end, true)
+end
+
+-- Resource cleanup
+AddEventHandler('onResourceStop', function(resourceName)
+    if GetCurrentResourceName() == resourceName then
+        -- Cleanup all ropes on resource stop
+        for ropeId, _ in pairs(ropes) do
+            TriggerClientEvent('flatbed:removeRopeClient', -1, ropeId)
+        end
+        
+        trucks = {}
+        ropes = {}
+        playerCooldowns = {}
+        
+        if config.debugMode then
+            print('[Flatbed] Resource stopped, all data cleared')
+        end
+    end
+end)
